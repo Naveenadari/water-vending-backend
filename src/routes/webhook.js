@@ -1,6 +1,7 @@
 const express = require('express');
 const { pool } = require('../db');
 const { matchAndConsume } = require('../sessionManager');
+const { sendToDevice } = require('../socket/deviceWs');
 
 const router = express.Router();
 
@@ -41,9 +42,8 @@ router.post('/notification', async (req, res) => {
       [session.deviceId, vendorId, amount, pulses, raw_text || null]
     );
 
-    // Tell the ESP32 to open the valve, via the socket layer.
-    const io = req.app.get('io');
-    io.of('/device').to(`device:${session.deviceId}`).emit('command', {
+    // Tell the ESP32 to open the valve, via the raw device WebSocket.
+    sendToDevice(session.deviceId, {
       type: 'dispense',
       source: 'upi',
       pulses,
@@ -51,6 +51,7 @@ router.post('/notification', async (req, res) => {
     });
 
     // Also let the vendor app know, for live dashboard updates.
+    const io = req.app.get('io');
     io.of('/app').to(`vendor:${vendorId}`).emit('payment_matched', {
       device_id: session.deviceId,
       amount: Number(amount),
