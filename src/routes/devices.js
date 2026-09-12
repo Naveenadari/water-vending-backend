@@ -4,8 +4,12 @@ const { requireAdmin } = require('./vendors');
 
 const router = express.Router();
 
+const VALVE_NAMES = ['Normal', 'Cooling'];
+
 // Create a device for a vendor - this generates the device_token that goes
-// straight into the ESP32 firmware (replaces BLYNK_AUTH_TOKEN).
+// straight into the ESP32 firmware. Sets up BOTH taps (Normal=0, Cooling=1):
+// one shared device_settings row, plus per-valve settings + 2 presets each
+// (matches the firmware's 2-preset-per-tap model).
 router.post('/', requireAdmin, async (req, res) => {
   const { vendor_id, name } = req.body;
   if (!vendor_id) return res.status(400).json({ error: 'vendor_id required' });
@@ -17,14 +21,18 @@ router.post('/', requireAdmin, async (req, res) => {
     );
     const device = result.rows[0];
 
-    // Default settings row + 4 empty presets, so the device has something
-    // sane to read on first connect.
-    await pool.query(`INSERT INTO settings (device_id) VALUES ($1)`, [device.id]);
-    for (let i = 0; i < 4; i++) {
-      await pool.query(
-        `INSERT INTO presets (device_id, slot_index, pulses, price_rupees) VALUES ($1, $2, 0, 0)`,
-        [device.id, i]
-      );
+    // Shared, device-level settings (one row per device) - topup/timeout/confirm_mode
+    await pool.query(`INSERT INTO device_settings (device_id) VALUES ($1)`, [device.id]);
+
+    // Per-valve settings + 2 presets each (Normal=0, Cooling=1)
+    for (const valve of [0, 1]) {
+      await pool.query(`INSERT INTO settings (device_id, valve) VALUES ($1, $2)`, [device.id, valve]);
+      for (let slot = 0; slot < 2; slot++) {
+        await pool.query(
+          `INSERT INTO presets (device_id, valve, slot_index, pulses, price_rupees) VALUES ($1, $2, $3, 0, 0)`,
+          [device.id, valve, slot]
+        );
+      }
     }
 
     res.status(201).json(device);
@@ -49,27 +57,48 @@ router.get('/vendor/:vendorId', async (req, res) => {
   }
 });
 
-// Full detail for one device: settings + presets + recent transactions
+// Full detail for one device: shared settings + BOTH valves' settings/presets
+// + recent transactions (each tagged with which valve it came from).
 router.get('/:deviceId', async (req, res) => {
   try {
     const deviceQ = await pool.query(`SELECT * FROM devices WHERE id = $1`, [req.params.deviceId]);
     if (deviceQ.rows.length === 0) return res.status(404).json({ error: 'not found' });
 
-    const [settingsQ, presetsQ, txQ] = await Promise.all([
-      pool.query(`SELECT * FROM settings WHERE device_id = $1`, [req.params.deviceId]),
-      pool.query(`SELECT * FROM presets WHERE device_id = $1 ORDER BY slot_index`, [req.params.deviceId]),
+    const [deviceSettingsQ, settingsQ, presetsQ, txQ] = await Promise.all([
       pool.query(
-        `SELECT id, source, amount_rupees, pulses, status, created_at
+        `SELECT topup_amount, timeout_seconds, confirm_mode FROM device_settings WHERE device_id = $1`,
+        [req.params.deviceId]
+      ),
+      pool.query(
+        `SELECT valve, pulses_per_rupee, trip_cost FROM settings WHERE device_id = $1 ORDER BY valve`,
+        [req.params.deviceId]
+      ),
+      pool.query(
+        `SELECT valve, slot_index, pulses FROM presets
+         WHERE device_id = $1 AND slot_index IN (0, 1) ORDER BY valve, slot_index`,
+        [req.params.deviceId]
+      ),
+      pool.query(
+        `SELECT id, valve, source, amount_rupees, pulses, status, created_at
          FROM transactions WHERE device_id = $1 ORDER BY created_at DESC LIMIT 20`,
         [req.params.deviceId]
       )
     ]);
 
+    // Group settings/presets by valve so the app can render "Normal" and
+    // "Cooling" as two clean sections without doing this matching itself.
+    const valves = [0, 1].map((v) => ({
+      valve: v,
+      name: VALVE_NAMES[v],
+      settings: settingsQ.rows.find((r) => r.valve === v) || { pulses_per_rupee: 20, trip_cost: 20 },
+      presets: presetsQ.rows.filter((r) => r.valve === v),
+    }));
+
     res.json({
       device: deviceQ.rows[0],
-      settings: settingsQ.rows[0],
-      presets: presetsQ.rows,
-      recent_transactions: txQ.rows
+      device_settings: deviceSettingsQ.rows[0] || { topup_amount: 100, timeout_seconds: 30, confirm_mode: true },
+      valves,
+      recent_transactions: txQ.rows,
     });
   } catch (err) {
     console.error(err);
