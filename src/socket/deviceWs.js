@@ -28,7 +28,6 @@ function isDeviceOnline(deviceId) {
 // field, and (NEW) a "valve" field: 0 = Normal tap, 1 = Cooling tap.
 function setupDeviceWebSocket(httpServer, appNs) {
   const wss = new WebSocketServer({ noServer: true });
-
   httpServer.on('upgrade', (request, socket, head) => {
     const { pathname, query } = url.parse(request.url, true);
     if (pathname !== '/device') return; // let socket.io handle its own upgrade
@@ -59,6 +58,9 @@ function setupDeviceWebSocket(httpServer, appNs) {
     const vendorId = deviceRow.vendor_id;
     deviceConnections.set(deviceId, { ws, vendorId });
     console.log(`Device connected (ws): ${deviceId}`);
+
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
 
     await pool.query(`UPDATE devices SET is_online = true, last_seen = now() WHERE id = $1`, [deviceId]);
     appNs.to(`vendor:${vendorId}`).emit('device_online', { device_id: deviceId });
@@ -144,6 +146,14 @@ function setupDeviceWebSocket(httpServer, appNs) {
 
     ws.on('close', async () => {
       console.log(`Device disconnected (ws): ${deviceId}`);
+      // Only act if this closing socket is still the one on record. If the
+      // device already reconnected (new ws replaced this entry in the map),
+      // a late close event from the OLD dead socket must NOT wipe out the
+      // new live connection - that was the bug causing "online" to flip
+      // back to "offline" ~1 minute after a reconnect.
+      const current = deviceConnections.get(deviceId);
+      if (!current || current.ws !== ws) return;
+
       deviceConnections.delete(deviceId);
       try {
         await pool.query(`UPDATE devices SET is_online = false, last_seen = now() WHERE id = $1`, [deviceId]);
@@ -155,6 +165,22 @@ function setupDeviceWebSocket(httpServer, appNs) {
 
     ws.on('error', (err) => console.error(`device ws error (${deviceId}):`, err.message));
   });
+
+  // Heartbeat: ping every connected device every 15s. If a device didn't
+  // respond to the PREVIOUS ping (isAlive still false), it's a dead/zombie
+  // connection - typically because the ESP32 lost power or WiFi abruptly
+  // without sending a clean close frame. Terminating it here fires the
+  // 'close' handler above, so the app shows "Offline" within ~15-30s
+  // instead of staying "Online" indefinitely.
+  const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (ws.isAlive === false) return ws.terminate();
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, 15000);
+
+  wss.on('close', () => clearInterval(heartbeatInterval));
 }
 
 module.exports = { setupDeviceWebSocket, sendToDevice, isDeviceOnline };
