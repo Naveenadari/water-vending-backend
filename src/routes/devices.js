@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const { pool } = require('../db');
 const { requireAdmin } = require('./vendors');
 
@@ -6,18 +7,26 @@ const router = express.Router();
 
 const VALVE_NAMES = ['Normal', 'Cooling'];
 
-// Create a device for a vendor - this generates the device_token that goes
-// straight into the ESP32 firmware. Sets up BOTH taps (Normal=0, Cooling=1):
-// one shared device_settings row, plus per-valve settings + 2 presets each
-// (matches the firmware's 2-preset-per-tap model).
+function generateClaimCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no O/0/I/1 to avoid confusion
+  let code = 'SOL-';
+  for (let i = 0; i < 6; i++) code += chars[crypto.randomInt(chars.length)];
+  return code;
+}
+
+// Create a device - this generates the device_token that goes straight into
+// the ESP32 firmware. vendor_id is now OPTIONAL: leave it out to create an
+// "unclaimed" machine (ready to hand to a vendor), who links it to their
+// account later via POST /claim during sign up, using the claim_code printed
+// on the machine's sticker/QR. Sets up BOTH taps (Normal=0, Cooling=1).
 router.post('/', requireAdmin, async (req, res) => {
-  const { vendor_id, name } = req.body;
-  if (!vendor_id) return res.status(400).json({ error: 'vendor_id required' });
+  const { vendor_id, name, claim_code } = req.body;
+  const code = claim_code || generateClaimCode();
   try {
     const result = await pool.query(
-      `INSERT INTO devices (vendor_id, name) VALUES ($1, $2)
-       RETURNING id, vendor_id, device_token, name, created_at`,
-      [vendor_id, name || 'Tap 1']
+      `INSERT INTO devices (vendor_id, name, claim_code) VALUES ($1, $2, $3)
+       RETURNING id, vendor_id, device_token, name, claim_code, created_at`,
+      [vendor_id || null, name || 'Tap 1', code]
     );
     const device = result.rows[0];
 
@@ -39,6 +48,31 @@ router.post('/', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'failed to create device' });
+  }
+});
+
+// Link an unclaimed device to a vendor account by its printed claim_code.
+// Used directly by the vendor-app signup flow (see routes/vendors.js).
+// Fails if the code doesn't exist or has already been claimed by someone else.
+router.post('/claim', async (req, res) => {
+  const { claim_code, vendor_id } = req.body;
+  if (!claim_code || !vendor_id) {
+    return res.status(400).json({ error: 'claim_code and vendor_id required' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE devices SET vendor_id = $1
+       WHERE claim_code = $2 AND vendor_id IS NULL
+       RETURNING id, name`,
+      [vendor_id, claim_code.trim().toUpperCase()]
+    );
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: 'Invalid or already-used machine code' });
+    }
+    res.json({ device: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'failed to claim device' });
   }
 });
 
