@@ -7,6 +7,9 @@ const deviceConnections = new Map();
 
 // Sends a JSON command to a device if it's currently connected.
 // Returns true if delivered, false if the device is offline.
+// NOTE: still keyed by deviceId only - ONE ESP32 = ONE WebSocket connection,
+// carrying BOTH valves (Normal=0, Cooling=1). Every command payload you send
+// must include a "valve" field so the firmware knows which tap it's for.
 function sendToDevice(deviceId, payload) {
   const conn = deviceConnections.get(deviceId);
   if (!conn || conn.ws.readyState !== conn.ws.OPEN) return false;
@@ -21,7 +24,8 @@ function isDeviceOnline(deviceId) {
 
 // Attaches a raw WebSocket server to the existing HTTP server at path /device.
 // ESP32 connects with: ws://host/device?token=DEVICE_TOKEN
-// Every message the device sends must be a single JSON object with a "type" field.
+// Every message the device sends must be a single JSON object with a "type"
+// field, and (NEW) a "valve" field: 0 = Normal tap, 1 = Cooling tap.
 function setupDeviceWebSocket(httpServer, appNs) {
   const wss = new WebSocketServer({ noServer: true });
 
@@ -64,34 +68,39 @@ function setupDeviceWebSocket(httpServer, appNs) {
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (!msg || !msg.type) return;
 
+      // NEW: normalize valve to 0 or 1 (defaults to 0 = Normal if a device
+      // sends an old-style message without a valve field, so this stays
+      // backward compatible with single-valve firmware during rollout).
+      const valve = (msg.valve === 1) ? 1 : 0;
+
       switch (msg.type) {
         case 'status':
-          // { type:'status', flow_lpm, valve_open, delivered_pulses, target_pulses }
-          appNs.to(`vendor:${vendorId}`).emit('device_status', { device_id: deviceId, ...msg });
+          // { type:'status', valve, flow_lpm, valve_open, delivered_pulses, target_pulses }
+          appNs.to(`vendor:${vendorId}`).emit('device_status', { device_id: deviceId, ...msg, valve });
           break;
 
         case 'transaction':
-          // { type:'transaction', source, amount_rupees, pulses, status }
+          // { type:'transaction', valve, source, amount_rupees, pulses, status }
           try {
             await pool.query(
-              `INSERT INTO transactions (device_id, vendor_id, source, amount_rupees, pulses, status)
-               VALUES ($1, $2, $3, $4, $5, $6)`,
-              [deviceId, vendorId, msg.source, msg.amount_rupees || null, msg.pulses || null, msg.status || 'completed']
+              `INSERT INTO transactions (device_id, vendor_id, valve, source, amount_rupees, pulses, status)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+              [deviceId, vendorId, valve, msg.source, msg.amount_rupees || null, msg.pulses || null, msg.status || 'completed']
             );
-            appNs.to(`vendor:${vendorId}`).emit('new_transaction', { device_id: deviceId, ...msg });
+            appNs.to(`vendor:${vendorId}`).emit('new_transaction', { device_id: deviceId, ...msg, valve });
           } catch (err) {
             console.error('failed to log transaction', err);
           }
           break;
 
         case 'settings_update':
-          // { type:'settings_update', presets:[{slot_index,pulses}], settings:{...} }
+          // { type:'settings_update', valve, presets:[{slot_index,pulses}], settings:{...} }
           try {
             if (msg.presets) {
               for (const p of msg.presets) {
                 await pool.query(
-                  `UPDATE presets SET pulses = $1 WHERE device_id = $2 AND slot_index = $3`,
-                  [p.pulses, deviceId, p.slot_index]
+                  `UPDATE presets SET pulses = $1 WHERE device_id = $2 AND valve = $3 AND slot_index = $4`,
+                  [p.pulses, deviceId, valve, p.slot_index]
                 );
               }
             }
@@ -103,11 +112,11 @@ function setupDeviceWebSocket(httpServer, appNs) {
                                       topup_amount = COALESCE($3, topup_amount),
                                       trip_cost = COALESCE($4, trip_cost),
                                       confirm_mode = COALESCE($5, confirm_mode)
-                 WHERE device_id = $6`,
-                [s.timeout_seconds, s.pulses_per_rupee, s.topup_amount, s.trip_cost, s.confirm_mode, deviceId]
+                 WHERE device_id = $6 AND valve = $7`,
+                [s.timeout_seconds, s.pulses_per_rupee, s.topup_amount, s.trip_cost, s.confirm_mode, deviceId, valve]
               );
             }
-            appNs.to(`vendor:${vendorId}`).emit('settings_synced', { device_id: deviceId });
+            appNs.to(`vendor:${vendorId}`).emit('settings_synced', { device_id: deviceId, valve });
           } catch (err) {
             console.error('failed to save settings_update', err);
           }
