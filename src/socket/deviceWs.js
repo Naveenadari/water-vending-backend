@@ -94,7 +94,9 @@ function setupDeviceWebSocket(httpServer, appNs) {
           break;
 
         case 'settings_update':
-          // { type:'settings_update', valve, presets:[{slot_index,pulses}], settings:{...} }
+          // { type:'settings_update', valve, presets:[{slot_index,pulses}],
+          //   settings:{ pulses_per_rupee, trip_cost,           <- per-valve
+          //              topup_amount, timeout_seconds, confirm_mode } }  <- shared
           try {
             if (msg.presets) {
               for (const p of msg.presets) {
@@ -106,15 +108,28 @@ function setupDeviceWebSocket(httpServer, appNs) {
             }
             if (msg.settings) {
               const s = msg.settings;
+
+              // Per-valve fields -> settings table, keyed by (device_id, valve)
               await pool.query(
-                `UPDATE settings SET timeout_seconds = COALESCE($1, timeout_seconds),
-                                      pulses_per_rupee = COALESCE($2, pulses_per_rupee),
-                                      topup_amount = COALESCE($3, topup_amount),
-                                      trip_cost = COALESCE($4, trip_cost),
-                                      confirm_mode = COALESCE($5, confirm_mode)
-                 WHERE device_id = $6 AND valve = $7`,
-                [s.timeout_seconds, s.pulses_per_rupee, s.topup_amount, s.trip_cost, s.confirm_mode, deviceId, valve]
+                `UPDATE settings SET pulses_per_rupee = COALESCE($1, pulses_per_rupee),
+                                      trip_cost = COALESCE($2, trip_cost)
+                 WHERE device_id = $3 AND valve = $4`,
+                [s.pulses_per_rupee, s.trip_cost, deviceId, valve]
               );
+
+              // Shared fields -> device_settings table, keyed by device_id only
+              // (NOT per valve - one topup amount / timeout / confirm_mode per device)
+              if (s.topup_amount !== undefined || s.timeout_seconds !== undefined || s.confirm_mode !== undefined) {
+                await pool.query(
+                  `INSERT INTO device_settings (device_id, topup_amount, timeout_seconds, confirm_mode)
+                   VALUES ($1, COALESCE($2, 100), COALESCE($3, 30), COALESCE($4, true))
+                   ON CONFLICT (device_id) DO UPDATE SET
+                     topup_amount = COALESCE($2, device_settings.topup_amount),
+                     timeout_seconds = COALESCE($3, device_settings.timeout_seconds),
+                     confirm_mode = COALESCE($4, device_settings.confirm_mode)`,
+                  [deviceId, s.topup_amount, s.timeout_seconds, s.confirm_mode]
+                );
+              }
             }
             appNs.to(`vendor:${vendorId}`).emit('settings_synced', { device_id: deviceId, valve });
           } catch (err) {
