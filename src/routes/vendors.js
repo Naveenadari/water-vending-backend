@@ -32,6 +32,50 @@ router.post('/', requireAdmin, async (req, res) => {
   }
 });
 
+// Public self-signup, used by the vendor app's "Sign up" screen. No admin
+// key needed. Creates the vendor account AND, in the same step, claims the
+// machine identified by claim_code (the code printed on that machine's
+// sticker/QR) - so that machine becomes linked to this vendor only, and no
+// other vendor's app can see or control it. If the code is invalid or was
+// already claimed by someone else, the vendor account is rolled back so we
+// don't leave an orphaned account behind.
+router.post('/signup', async (req, res) => {
+  const { name, phone, pin, claim_code } = req.body;
+  if (!name || !phone || !pin || !claim_code) {
+    return res.status(400).json({ error: 'name, phone, pin and claim_code are required' });
+  }
+  try {
+    const existing = await pool.query(`SELECT id FROM vendors WHERE phone = $1`, [phone]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'This phone number is already registered' });
+    }
+
+    const vendorResult = await pool.query(
+      `INSERT INTO vendors (name, phone, admin_pin) VALUES ($1, $2, $3)
+       RETURNING id, name, phone, upi_id`,
+      [name, phone, pin]
+    );
+    const vendor = vendorResult.rows[0];
+
+    const claimResult = await pool.query(
+      `UPDATE devices SET vendor_id = $1
+       WHERE claim_code = $2 AND vendor_id IS NULL
+       RETURNING id, name`,
+      [vendor.id, claim_code.trim().toUpperCase()]
+    );
+
+    if (claimResult.rows.length === 0) {
+      await pool.query(`DELETE FROM vendors WHERE id = $1`, [vendor.id]);
+      return res.status(400).json({ error: 'Invalid or already-used machine code' });
+    }
+
+    res.status(201).json({ vendor, device: claimResult.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'signup failed' });
+  }
+});
+
 // Simple login for the vendor app (MVP auth - phone + PIN)
 // Returns the vendor_id which the app stores and uses as a bearer token
 // for socket connections and the webhook endpoint.
