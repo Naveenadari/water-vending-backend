@@ -146,7 +146,7 @@ router.post('/webhook', async (req, res) => {
     console.log(`razorpay webhook: matched vending device ${device.id}`);
 
     const settingsRes = await pool.query(
-      `SELECT valve, qr_pulses FROM settings WHERE device_id = $1 AND qr_price_rupees = $2`,
+      `SELECT valve, pulses FROM qr_prices WHERE device_id = $1 AND price_rupees = $2`,
       [device.id, amountRupees]
     );
     const matched = settingsRes.rows[0];
@@ -174,12 +174,12 @@ router.post('/webhook', async (req, res) => {
       }
       return;
     }
-    console.log(`razorpay webhook: matched valve ${matched.valve}, ${matched.qr_pulses} pulses - sending dispense`);
+    console.log(`razorpay webhook: matched valve ${matched.valve}, ${matched.pulses} pulses - sending dispense`);
 
     const delivered = sendToDevice(device.id, {
       type: 'dispense',
       valve: matched.valve,
-      pulses: matched.qr_pulses,
+      pulses: matched.pulses,
       source: 'razorpay',
       razorpay_payment_id: payment.id,
     });
@@ -206,9 +206,9 @@ router.post('/webhook', async (req, res) => {
 // the firmware at all (unlike the manual button presets) - the webhook
 // above reads it directly when matching an incoming payment amount.
 router.post('/price', async (req, res) => {
-  const { device_id, vendor_id, valve, price_rupees, litres } = req.body;
-  if (!device_id || !vendor_id || valve === undefined || !price_rupees || !litres) {
-    return res.status(400).json({ error: 'device_id, vendor_id, valve, price_rupees and litres are required' });
+  const { device_id, vendor_id, valve, slot_index, price_rupees, litres } = req.body;
+  if (!device_id || !vendor_id || valve === undefined || slot_index === undefined || !price_rupees || !litres) {
+    return res.status(400).json({ error: 'device_id, vendor_id, valve, slot_index, price_rupees and litres are required' });
   }
   try {
     const deviceRes = await pool.query(`SELECT vendor_id FROM devices WHERE id = $1`, [device_id]);
@@ -221,11 +221,20 @@ router.post('/price', async (req, res) => {
     const pulsesPerLiter = settingsRes.rows[0]?.pulses_per_liter || 240;
     const pulses = Math.round(litres * pulsesPerLiter);
     await pool.query(
-      `UPDATE settings SET qr_price_rupees = $1, qr_pulses = $2 WHERE device_id = $3 AND valve = $4`,
-      [price_rupees, pulses, device_id, valve]
+      `INSERT INTO qr_prices (device_id, valve, slot_index, price_rupees, pulses)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (device_id, valve, slot_index)
+       DO UPDATE SET price_rupees = $4, pulses = $5`,
+      [device_id, valve, slot_index, price_rupees, pulses]
     );
     res.json({ ok: true });
   } catch (err) {
+    if (err.code === '23505') {
+      // the (device_id, price_rupees) unique constraint - two buttons on
+      // this machine can't share the same amount, since amount alone is
+      // what identifies which button was paid for
+      return res.status(400).json({ error: 'Another button on this machine already uses that exact price - pick a different amount' });
+    }
     console.error('razorpay price update failed', err);
     res.status(500).json({ error: 'failed to save price' });
   }
