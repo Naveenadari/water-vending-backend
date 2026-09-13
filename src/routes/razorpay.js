@@ -86,6 +86,7 @@ async function forwardToWaterManagement(rawBody, signature) {
 // Keep it subscribed to whatever events it already was. Keep the SAME
 // webhook secret - copy it into RAZORPAY_WEBHOOK_SECRET on Render.
 router.post('/webhook', async (req, res) => {
+  console.log('razorpay webhook: request received');
   let signature, expected;
   try {
     signature = req.headers['x-razorpay-signature'];
@@ -117,8 +118,9 @@ router.post('/webhook', async (req, res) => {
 
   try {
     const event = req.body;
+    console.log('razorpay webhook: event =', event.event);
     if (event.event !== 'payment.captured') {
-      // Not an event type we act on ourselves - hand it to water-management.
+      console.log('razorpay webhook: not payment.captured, forwarding to water-management');
       await forwardToWaterManagement(req.rawBody, signature);
       return;
     }
@@ -126,16 +128,18 @@ router.post('/webhook', async (req, res) => {
     const payment = event.payload.payment.entity;
     const qrCodeId = payment.qr_code_id;
     const amountRupees = payment.amount / 100;
+    console.log(`razorpay webhook: payment ${payment.id}, amount ₹${amountRupees}, qr_code_id=${qrCodeId}`);
 
     const device = qrCodeId
       ? (await pool.query(`SELECT id, vendor_id FROM devices WHERE razorpay_qr_id = $1`, [qrCodeId])).rows[0]
       : null;
 
     if (!device) {
-      // Not a vending-machine QR payment - this belongs to water-management.
+      console.log('razorpay webhook: qr_code_id does not match any vending device - forwarding to water-management');
       await forwardToWaterManagement(req.rawBody, signature);
       return;
     }
+    console.log(`razorpay webhook: matched vending device ${device.id}`);
 
     const settingsRes = await pool.query(
       `SELECT valve, qr_pulses FROM settings WHERE device_id = $1 AND qr_price_rupees = $2`,
@@ -144,6 +148,7 @@ router.post('/webhook', async (req, res) => {
     const matched = settingsRes.rows[0];
 
     if (!matched) {
+      console.log(`razorpay webhook: ₹${amountRupees} doesn't match either valve's price on device ${device.id} - refunding`);
       // Amount doesn't match either valve's price - can't fulfil it, so
       // refund immediately rather than silently keeping the customer's money.
       await pool.query(
@@ -159,11 +164,13 @@ router.post('/webhook', async (req, res) => {
            WHERE razorpay_payment_id = $3`,
           [refund.id, refund.amount / 100, payment.id]
         );
+        console.log(`razorpay webhook: refunded ${payment.id}`);
       } catch (refundErr) {
         console.error('razorpay auto-refund (unmatched amount) failed', refundErr);
       }
       return;
     }
+    console.log(`razorpay webhook: matched valve ${matched.valve}, ${matched.qr_pulses} pulses - sending dispense`);
 
     const delivered = sendToDevice(device.id, {
       type: 'dispense',
@@ -172,6 +179,7 @@ router.post('/webhook', async (req, res) => {
       source: 'razorpay',
       razorpay_payment_id: payment.id,
     });
+    console.log(`razorpay webhook: sendToDevice returned delivered=${delivered}`);
 
     await pool.query(
       `INSERT INTO razorpay_payments (vendor_id, device_id, valve, razorpay_payment_id, amount_rupees, status, dispensed)
