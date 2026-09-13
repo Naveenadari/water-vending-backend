@@ -168,7 +168,11 @@ router.post('/price', async (req, res) => {
     if (!deviceRes.rows[0] || deviceRes.rows[0].vendor_id !== vendor_id) {
       return res.status(403).json({ error: 'not your device' });
     }
-    const pulses = Math.round(litres * 240); // PULSES_PER_LITER - keep in sync with firmware
+    const settingsRes = await pool.query(
+      `SELECT pulses_per_liter FROM device_settings WHERE device_id = $1`, [device_id]
+    );
+    const pulsesPerLiter = settingsRes.rows[0]?.pulses_per_liter || 240;
+    const pulses = Math.round(litres * pulsesPerLiter);
     await pool.query(
       `UPDATE settings SET qr_price_rupees = $1, qr_pulses = $2 WHERE device_id = $3 AND valve = $4`,
       [price_rupees, pulses, device_id, valve]
