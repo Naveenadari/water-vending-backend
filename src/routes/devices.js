@@ -104,7 +104,7 @@ router.get('/:deviceId', async (req, res) => {
         [req.params.deviceId]
       ),
       pool.query(
-        `SELECT valve, pulses_per_rupee, trip_cost FROM settings WHERE device_id = $1 ORDER BY valve`,
+        `SELECT valve, pulses_per_rupee, trip_cost, qr_price_rupees, qr_pulses FROM settings WHERE device_id = $1 ORDER BY valve`,
         [req.params.deviceId]
       ),
       pool.query(
