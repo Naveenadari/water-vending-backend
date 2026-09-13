@@ -100,7 +100,7 @@ router.get('/:deviceId', async (req, res) => {
 
     const [deviceSettingsQ, settingsQ, presetsQ, txQ] = await Promise.all([
       pool.query(
-        `SELECT topup_amount, timeout_seconds, confirm_mode FROM device_settings WHERE device_id = $1`,
+        `SELECT topup_amount, timeout_seconds, confirm_mode, pulses_per_liter FROM device_settings WHERE device_id = $1`,
         [req.params.deviceId]
       ),
       pool.query(
