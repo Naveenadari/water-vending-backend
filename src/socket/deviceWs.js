@@ -28,6 +28,16 @@ function isDeviceOnline(deviceId) {
 // field, and (NEW) a "valve" field: 0 = Normal tap, 1 = Cooling tap.
 function setupDeviceWebSocket(httpServer, appNs) {
   const wss = new WebSocketServer({ noServer: true });
+
+  // Every deploy/restart wipes the in-memory deviceConnections map, but
+  // NOT the database - a device that was online before the restart would
+  // otherwise stay stuck showing "Online" in the app until it happens to
+  // disconnect/reconnect again for real. Reset everyone to offline here so
+  // the app reflects reality immediately after every deploy; devices mark
+  // themselves online again within seconds as they actually reconnect.
+  pool.query(`UPDATE devices SET is_online = false WHERE is_online = true`)
+    .catch((err) => console.error('failed to reset device online status on boot', err));
+
   httpServer.on('upgrade', (request, socket, head) => {
     const { pathname, query } = url.parse(request.url, true);
     if (pathname !== '/device') return; // let socket.io handle its own upgrade
