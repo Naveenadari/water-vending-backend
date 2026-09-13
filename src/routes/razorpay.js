@@ -86,11 +86,25 @@ async function forwardToWaterManagement(rawBody, signature) {
 // Keep it subscribed to whatever events it already was. Keep the SAME
 // webhook secret - copy it into RAZORPAY_WEBHOOK_SECRET on Render.
 router.post('/webhook', async (req, res) => {
-  const signature = req.headers['x-razorpay-signature'];
-  const expected = crypto
-    .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
-    .update(req.rawBody)
-    .digest('hex');
+  let signature, expected;
+  try {
+    signature = req.headers['x-razorpay-signature'];
+    if (!process.env.RAZORPAY_WEBHOOK_SECRET) {
+      throw new Error('RAZORPAY_WEBHOOK_SECRET is not set');
+    }
+    if (!req.rawBody) {
+      throw new Error('req.rawBody missing - check express.json() verify hook in server.js');
+    }
+    expected = crypto
+      .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
+      .update(req.rawBody)
+      .digest('hex');
+  } catch (setupErr) {
+    // NEVER let a config problem crash the whole server - just fail this
+    // one request loudly in the logs so it's easy to spot and fix.
+    console.error('razorpay webhook: signature setup failed -', setupErr.message);
+    return res.status(500).json({ error: 'webhook misconfigured' });
+  }
 
   if (!signature || signature !== expected) {
     console.warn('razorpay webhook: signature mismatch');
