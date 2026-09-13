@@ -130,16 +130,20 @@ function setupDeviceWebSocket(httpServer, appNs) {
               );
 
               // Shared fields -> device_settings table, keyed by device_id only
-              // (NOT per valve - one topup amount / timeout / confirm_mode per device)
-              if (s.topup_amount !== undefined || s.timeout_seconds !== undefined || s.confirm_mode !== undefined) {
+              // (NOT per valve - one topup amount / timeout / confirm_mode /
+              // pulses_per_liter per device, since it's one flow sensor per tap
+              // but calibration is stored device-wide for simplicity)
+              if (s.topup_amount !== undefined || s.timeout_seconds !== undefined
+                  || s.confirm_mode !== undefined || s.pulses_per_liter !== undefined) {
                 await pool.query(
-                  `INSERT INTO device_settings (device_id, topup_amount, timeout_seconds, confirm_mode)
-                   VALUES ($1, COALESCE($2, 100), COALESCE($3, 30), COALESCE($4, true))
+                  `INSERT INTO device_settings (device_id, topup_amount, timeout_seconds, confirm_mode, pulses_per_liter)
+                   VALUES ($1, COALESCE($2, 100), COALESCE($3, 30), COALESCE($4, true), COALESCE($5, 240))
                    ON CONFLICT (device_id) DO UPDATE SET
                      topup_amount = COALESCE($2, device_settings.topup_amount),
                      timeout_seconds = COALESCE($3, device_settings.timeout_seconds),
-                     confirm_mode = COALESCE($4, device_settings.confirm_mode)`,
-                  [deviceId, s.topup_amount, s.timeout_seconds, s.confirm_mode]
+                     confirm_mode = COALESCE($4, device_settings.confirm_mode),
+                     pulses_per_liter = COALESCE($5, device_settings.pulses_per_liter)`,
+                  [deviceId, s.topup_amount, s.timeout_seconds, s.confirm_mode, s.pulses_per_liter]
                 );
               }
             }
