@@ -58,11 +58,33 @@ router.post('/qr', async (req, res) => {
   }
 });
 
-// Razorpay calls this on every payment made to ANY device's QR code.
-// Register this exact URL in Razorpay Dashboard -> Settings -> Webhooks:
+// This account's webhook is shared with the water-management app (Razorpay
+// account plan only allows one webhook). Anything that isn't a vending-
+// machine QR payment gets forwarded here, untouched, so water-management
+// keeps working exactly as before.
+const WATER_MANAGEMENT_WEBHOOK_URL = 'https://water-vending-server.onrender.com/webhook';
+
+async function forwardToWaterManagement(rawBody, signature) {
+  try {
+    await fetch(WATER_MANAGEMENT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-razorpay-signature': signature,
+      },
+      body: rawBody,
+    });
+  } catch (err) {
+    console.error('failed to forward webhook to water-management', err);
+  }
+}
+
+// Razorpay calls this on EVERY payment on the account (shared webhook -
+// see forwardToWaterManagement above). Register this exact URL in
+// Razorpay Dashboard -> Settings -> Webhooks (replacing the old one):
 //   https://<your-backend>.onrender.com/api/razorpay/webhook
-// subscribed to the "payment.captured" event. Copy the secret Razorpay
-// shows you there into the RAZORPAY_WEBHOOK_SECRET env var on Render.
+// Keep it subscribed to whatever events it already was. Keep the SAME
+// webhook secret - copy it into RAZORPAY_WEBHOOK_SECRET on Render.
 router.post('/webhook', async (req, res) => {
   const signature = req.headers['x-razorpay-signature'];
   const expected = crypto
@@ -81,24 +103,23 @@ router.post('/webhook', async (req, res) => {
 
   try {
     const event = req.body;
-    if (event.event !== 'payment.captured') return;
+    if (event.event !== 'payment.captured') {
+      // Not an event type we act on ourselves - hand it to water-management.
+      await forwardToWaterManagement(req.rawBody, signature);
+      return;
+    }
 
     const payment = event.payload.payment.entity;
     const qrCodeId = payment.qr_code_id;
     const amountRupees = payment.amount / 100;
 
-    if (!qrCodeId) {
-      console.warn('razorpay webhook: payment has no qr_code_id, ignoring', payment.id);
-      return;
-    }
+    const device = qrCodeId
+      ? (await pool.query(`SELECT id, vendor_id FROM devices WHERE razorpay_qr_id = $1`, [qrCodeId])).rows[0]
+      : null;
 
-    const deviceRes = await pool.query(
-      `SELECT id, vendor_id FROM devices WHERE razorpay_qr_id = $1`,
-      [qrCodeId]
-    );
-    const device = deviceRes.rows[0];
     if (!device) {
-      console.warn('razorpay webhook: no device linked to qr', qrCodeId);
+      // Not a vending-machine QR payment - this belongs to water-management.
+      await forwardToWaterManagement(req.rawBody, signature);
       return;
     }
 
