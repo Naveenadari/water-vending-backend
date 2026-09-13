@@ -1,0 +1,203 @@
+const express = require('express');
+const crypto = require('crypto');
+const Razorpay = require('razorpay');
+const { pool } = require('../db');
+const { sendToDevice } = require('../socket/deviceWs');
+
+const router = express.Router();
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+
+// Create (or return the existing) single QR code for a device. Call this
+// once when a vendor switches a machine to Razorpay mode (or wants to
+// reprint the sticker). The QR has NO fixed amount - the customer pays
+// whatever amount matches the valve they want (see the webhook below,
+// which looks up the valve by matching the amount paid).
+router.post('/qr', async (req, res) => {
+  const { device_id, vendor_id } = req.body;
+  if (!device_id || !vendor_id) {
+    return res.status(400).json({ error: 'device_id and vendor_id required' });
+  }
+  try {
+    const deviceRes = await pool.query(
+      `SELECT id, vendor_id, razorpay_qr_id, name FROM devices WHERE id = $1`,
+      [device_id]
+    );
+    const device = deviceRes.rows[0];
+    if (!device || device.vendor_id !== vendor_id) {
+      return res.status(403).json({ error: 'not your device' });
+    }
+
+    if (device.razorpay_qr_id) {
+      try {
+        const existing = await razorpay.qrCode.fetch(device.razorpay_qr_id);
+        if (existing.status === 'active') {
+          return res.json({ qr_id: existing.id, image_url: existing.image_url });
+        }
+      } catch (e) {
+        // fall through and create a new one if the old one can't be fetched
+      }
+    }
+
+    const qr = await razorpay.qrCode.create({
+      type: 'upi_qr',
+      usage: 'multiple_use',
+      fixed_amount: false,
+      description: `Sol Electronics - ${device.name || device_id}`,
+      notes: { device_id, vendor_id },
+    });
+
+    await pool.query(`UPDATE devices SET razorpay_qr_id = $1 WHERE id = $2`, [qr.id, device_id]);
+    res.json({ qr_id: qr.id, image_url: qr.image_url });
+  } catch (err) {
+    console.error('razorpay qr create failed', err);
+    res.status(500).json({ error: 'failed to create QR code' });
+  }
+});
+
+// Razorpay calls this on every payment made to ANY device's QR code.
+// Register this exact URL in Razorpay Dashboard -> Settings -> Webhooks:
+//   https://<your-backend>.onrender.com/api/razorpay/webhook
+// subscribed to the "payment.captured" event. Copy the secret Razorpay
+// shows you there into the RAZORPAY_WEBHOOK_SECRET env var on Render.
+router.post('/webhook', async (req, res) => {
+  const signature = req.headers['x-razorpay-signature'];
+  const expected = crypto
+    .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
+    .update(req.rawBody)
+    .digest('hex');
+
+  if (!signature || signature !== expected) {
+    console.warn('razorpay webhook: signature mismatch');
+    return res.status(400).json({ error: 'invalid signature' });
+  }
+
+  // Acknowledge immediately - Razorpay retries aggressively if we're slow,
+  // and we don't want a slow DB query to cause duplicate webhook retries.
+  res.json({ received: true });
+
+  try {
+    const event = req.body;
+    if (event.event !== 'payment.captured') return;
+
+    const payment = event.payload.payment.entity;
+    const qrCodeId = payment.qr_code_id;
+    const amountRupees = payment.amount / 100;
+
+    if (!qrCodeId) {
+      console.warn('razorpay webhook: payment has no qr_code_id, ignoring', payment.id);
+      return;
+    }
+
+    const deviceRes = await pool.query(
+      `SELECT id, vendor_id FROM devices WHERE razorpay_qr_id = $1`,
+      [qrCodeId]
+    );
+    const device = deviceRes.rows[0];
+    if (!device) {
+      console.warn('razorpay webhook: no device linked to qr', qrCodeId);
+      return;
+    }
+
+    const settingsRes = await pool.query(
+      `SELECT valve, qr_pulses FROM settings WHERE device_id = $1 AND qr_price_rupees = $2`,
+      [device.id, amountRupees]
+    );
+    const matched = settingsRes.rows[0];
+
+    if (!matched) {
+      // Amount doesn't match either valve's price - can't fulfil it, so
+      // refund immediately rather than silently keeping the customer's money.
+      await pool.query(
+        `INSERT INTO razorpay_payments (vendor_id, device_id, valve, razorpay_payment_id, amount_rupees, status)
+         VALUES ($1, $2, NULL, $3, $4, 'unmatched')
+         ON CONFLICT (razorpay_payment_id) DO NOTHING`,
+        [device.vendor_id, device.id, payment.id, amountRupees]
+      );
+      try {
+        const refund = await razorpay.payments.refund(payment.id, {});
+        await pool.query(
+          `UPDATE razorpay_payments SET status = 'refunded', refund_id = $1, refund_amount = $2
+           WHERE razorpay_payment_id = $3`,
+          [refund.id, refund.amount / 100, payment.id]
+        );
+      } catch (refundErr) {
+        console.error('razorpay auto-refund (unmatched amount) failed', refundErr);
+      }
+      return;
+    }
+
+    const delivered = sendToDevice(device.id, {
+      type: 'dispense',
+      valve: matched.valve,
+      pulses: matched.qr_pulses,
+      source: 'razorpay',
+      razorpay_payment_id: payment.id,
+    });
+
+    await pool.query(
+      `INSERT INTO razorpay_payments (vendor_id, device_id, valve, razorpay_payment_id, amount_rupees, status, dispensed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (razorpay_payment_id) DO NOTHING`,
+      [device.vendor_id, device.id, matched.valve, payment.id, amountRupees,
+        delivered ? 'dispensed' : 'captured', delivered]
+    );
+
+    if (!delivered) {
+      console.warn(`razorpay payment ${payment.id} captured but device ${device.id} is offline - could not dispense`);
+    }
+  } catch (err) {
+    console.error('razorpay webhook processing failed', err);
+  }
+});
+
+// Vendor sets/edits a valve's Razorpay trigger price + quantity - e.g.
+// "pay Rs 10, get 20L Normal water". This is a plain DB value, not sent to
+// the firmware at all (unlike the manual button presets) - the webhook
+// above reads it directly when matching an incoming payment amount.
+router.post('/price', async (req, res) => {
+  const { device_id, vendor_id, valve, price_rupees, litres } = req.body;
+  if (!device_id || !vendor_id || valve === undefined || !price_rupees || !litres) {
+    return res.status(400).json({ error: 'device_id, vendor_id, valve, price_rupees and litres are required' });
+  }
+  try {
+    const deviceRes = await pool.query(`SELECT vendor_id FROM devices WHERE id = $1`, [device_id]);
+    if (!deviceRes.rows[0] || deviceRes.rows[0].vendor_id !== vendor_id) {
+      return res.status(403).json({ error: 'not your device' });
+    }
+    const pulses = Math.round(litres * 240); // PULSES_PER_LITER - keep in sync with firmware
+    await pool.query(
+      `UPDATE settings SET qr_price_rupees = $1, qr_pulses = $2 WHERE device_id = $3 AND valve = $4`,
+      [price_rupees, pulses, device_id, valve]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('razorpay price update failed', err);
+    res.status(500).json({ error: 'failed to save price' });
+  }
+});
+
+// Vendor switches a machine's payment collection method - no code/DB
+// migration needed each time, just flips this column.
+router.post('/payment-mode', async (req, res) => {
+  const { device_id, vendor_id, payment_mode } = req.body;
+  if (!device_id || !vendor_id || !['macrodroid', 'razorpay'].includes(payment_mode)) {
+    return res.status(400).json({ error: 'device_id, vendor_id and a valid payment_mode are required' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE devices SET payment_mode = $1 WHERE id = $2 AND vendor_id = $3 RETURNING id, payment_mode`,
+      [payment_mode, device_id, vendor_id]
+    );
+    if (result.rows.length === 0) return res.status(403).json({ error: 'not your device' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('payment mode update failed', err);
+    res.status(500).json({ error: 'failed to update payment mode' });
+  }
+});
+
+module.exports = router;
