@@ -119,14 +119,18 @@ router.post('/webhook', async (req, res) => {
   try {
     const event = req.body;
     console.log('razorpay webhook: event =', event.event);
-    if (event.event !== 'payment.captured') {
-      console.log('razorpay webhook: not payment.captured, forwarding to water-management');
+
+    // QR-code payments arrive as "qr_code.credited" - THIS is where the
+    // qr_code id actually lives, not on payment.captured (which is what we
+    // were checking before - it never has qr_code_id, hence "undefined").
+    if (event.event !== 'qr_code.credited') {
+      console.log('razorpay webhook: not qr_code.credited, forwarding to water-management');
       await forwardToWaterManagement(req.rawBody, signature);
       return;
     }
 
     const payment = event.payload.payment.entity;
-    const qrCodeId = payment.qr_code_id;
+    const qrCodeId = event.payload.qr_code.entity.id;
     const amountRupees = payment.amount / 100;
     console.log(`razorpay webhook: payment ${payment.id}, amount ₹${amountRupees}, qr_code_id=${qrCodeId}`);
 
