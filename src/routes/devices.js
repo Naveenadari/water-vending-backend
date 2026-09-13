@@ -20,23 +20,30 @@ function generateClaimCode() {
 // account later via POST /claim during sign up, using the claim_code printed
 // on the machine's sticker/QR. Sets up BOTH taps (Normal=0, Cooling=1).
 router.post('/', requireAdmin, async (req, res) => {
-  const { vendor_id, name, claim_code } = req.body;
+  const { vendor_id, name, claim_code, valve_count, payment_hardware } = req.body;
   const code = claim_code || generateClaimCode();
+  const valveCount = [1, 2].includes(Number(valve_count)) ? Number(valve_count) : 2;
+  const hardware = payment_hardware === 'upi_only' ? 'upi_only' : 'full';
+  const slotsPerValve = hardware === 'upi_only' ? 4 : 2;
+  const valves = valveCount === 1 ? [0] : [0, 1]; // single tap = Normal (valve 0) only
+
   try {
     const result = await pool.query(
-      `INSERT INTO devices (vendor_id, name, claim_code) VALUES ($1, $2, $3)
-       RETURNING id, vendor_id, device_token, name, claim_code, created_at`,
-      [vendor_id || null, name || 'Tap 1', code]
+      `INSERT INTO devices (vendor_id, name, claim_code, valve_count, payment_hardware)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, vendor_id, device_token, name, claim_code, valve_count, payment_hardware, created_at`,
+      [vendor_id || null, name || 'Tap 1', code, valveCount, hardware]
     );
     const device = result.rows[0];
 
     // Shared, device-level settings (one row per device) - topup/timeout/confirm_mode
     await pool.query(`INSERT INTO device_settings (device_id) VALUES ($1)`, [device.id]);
 
-    // Per-valve settings + 2 presets each (Normal=0, Cooling=1)
-    for (const valve of [0, 1]) {
+    // Per-valve settings + presets (2 slots for coin/card/UPI machines,
+    // 4 slots for UPI-only machines that need more volume options)
+    for (const valve of valves) {
       await pool.query(`INSERT INTO settings (device_id, valve) VALUES ($1, $2)`, [device.id, valve]);
-      for (let slot = 0; slot < 2; slot++) {
+      for (let slot = 0; slot < slotsPerValve; slot++) {
         await pool.query(
           `INSERT INTO presets (device_id, valve, slot_index, pulses, price_rupees) VALUES ($1, $2, $3, 0, 0)`,
           [device.id, valve, slot]
@@ -98,18 +105,23 @@ router.get('/:deviceId', async (req, res) => {
     const deviceQ = await pool.query(`SELECT * FROM devices WHERE id = $1`, [req.params.deviceId]);
     if (deviceQ.rows.length === 0) return res.status(404).json({ error: 'not found' });
 
-    const [deviceSettingsQ, settingsQ, presetsQ, txQ] = await Promise.all([
+    const [deviceSettingsQ, settingsQ, presetsQ, qrPricesQ, txQ] = await Promise.all([
       pool.query(
         `SELECT topup_amount, timeout_seconds, confirm_mode, pulses_per_liter FROM device_settings WHERE device_id = $1`,
         [req.params.deviceId]
       ),
       pool.query(
-        `SELECT valve, pulses_per_rupee, trip_cost, qr_price_rupees, qr_pulses FROM settings WHERE device_id = $1 ORDER BY valve`,
+        `SELECT valve, pulses_per_rupee, trip_cost FROM settings WHERE device_id = $1 ORDER BY valve`,
         [req.params.deviceId]
       ),
       pool.query(
         `SELECT valve, slot_index, pulses FROM presets
-         WHERE device_id = $1 AND slot_index IN (0, 1) ORDER BY valve, slot_index`,
+         WHERE device_id = $1 ORDER BY valve, slot_index`,
+        [req.params.deviceId]
+      ),
+      pool.query(
+        `SELECT valve, slot_index, price_rupees, pulses FROM qr_prices
+         WHERE device_id = $1 ORDER BY valve, slot_index`,
         [req.params.deviceId]
       ),
       pool.query(
@@ -119,17 +131,23 @@ router.get('/:deviceId', async (req, res) => {
       )
     ]);
 
-    // Group settings/presets by valve so the app can render "Normal" and
-    // "Cooling" as two clean sections without doing this matching itself.
-    const valves = [0, 1].map((v) => ({
+    // Group settings/presets by valve so the app can render each tap as a
+    // clean section without doing this matching itself. Only build entries
+    // for the valves this specific machine actually has (1 for single tap,
+    // 2 for dual tap) - showing a fake "Cooling" section on a single-tap
+    // machine would be wrong.
+    const device = deviceQ.rows[0];
+    const valveIndices = device.valve_count === 1 ? [0] : [0, 1];
+    const valves = valveIndices.map((v) => ({
       valve: v,
       name: VALVE_NAMES[v],
       settings: settingsQ.rows.find((r) => r.valve === v) || { pulses_per_rupee: 20, trip_cost: 20 },
       presets: presetsQ.rows.filter((r) => r.valve === v),
+      qr_prices: qrPricesQ.rows.filter((r) => r.valve === v),
     }));
 
     res.json({
-      device: deviceQ.rows[0],
+      device,
       device_settings: deviceSettingsQ.rows[0] || { topup_amount: 100, timeout_seconds: 30, confirm_mode: true },
       valves,
       recent_transactions: txQ.rows,
