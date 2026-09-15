@@ -1,15 +1,16 @@
 const express = require('express');
 const { pool } = require('../db');
-const { matchAndConsume } = require('../sessionManager');
 const { sendToDevice } = require('../socket/deviceWs');
 
 const router = express.Router();
 
-// Called by the companion Android app (Notification Listener) on the
-// vendor's phone whenever a "payment received" notification appears.
+// Called by the companion Android app (Notification Listener) whenever a
+// "payment received" notification appears on the vendor's ONE dedicated
+// UPI Business app. No physical button press on the machine is needed -
+// the amount alone determines which valve/volume to dispense, matched
+// against qr_prices (the same per-button price table also used by the
+// Razorpay flow - set in the app's Settings tab).
 // Body: { phone, pin, amount, raw_text }
-// (phone+pin re-used as a lightweight bearer since this app only ever
-// belongs to one vendor - fine for MVP, tighten later with a real token.)
 router.post('/notification', async (req, res) => {
   const { phone, pin, amount, raw_text } = req.body;
   if (!phone || !pin || !amount) {
@@ -24,41 +25,45 @@ router.post('/notification', async (req, res) => {
     if (vendorQ.rows.length === 0) return res.status(401).json({ error: 'invalid vendor credentials' });
     const vendorId = vendorQ.rows[0].id;
 
-    const session = matchAndConsume(vendorId, Number(amount));
-    if (!session) {
-      // No machine was waiting for this amount right now - log it, don't fail.
-      console.log(`No pending session matched vendor=${vendorId} amount=${amount}`);
+    const matchQ = await pool.query(
+      `SELECT qp.device_id, qp.valve, qp.pulses
+       FROM qr_prices qp
+       JOIN devices d ON d.id = qp.device_id
+       WHERE d.vendor_id = $1 AND qp.price_rupees = $2`,
+      [vendorId, Number(amount)]
+    );
+
+    if (matchQ.rows.length === 0) {
+      // Unlike Razorpay, there's no API to auto-refund a plain UPI payment
+      // sent to a personal/business UPI ID - the money has already landed.
+      // Just log it so the vendor can investigate/manually refund if needed.
+      console.log(`No price matches vendor=${vendorId} amount=${amount} - not dispensing (cannot auto-refund this payment method)`);
       return res.json({ matched: false });
     }
 
-    // Fetch device's trip cost -> pulses to dispense (fallback: amount * pulses_per_rupee)
-    const settingsQ = await pool.query(`SELECT * FROM settings WHERE device_id = $1`, [session.deviceId]);
-    const settings = settingsQ.rows[0];
-    const pulses = settings ? Number(amount) * settings.pulses_per_rupee : 0;
+    const { device_id, valve, pulses } = matchQ.rows[0];
 
     await pool.query(
-      `INSERT INTO transactions (device_id, vendor_id, source, amount_rupees, pulses, status, raw_note)
-       VALUES ($1, $2, 'upi', $3, $4, 'completed', $5)`,
-      [session.deviceId, vendorId, amount, pulses, raw_text || null]
+      `INSERT INTO transactions (device_id, vendor_id, valve, source, amount_rupees, pulses, status, raw_note)
+       VALUES ($1, $2, $3, 'upi', $4, $5, 'completed', $6)`,
+      [device_id, vendorId, valve, amount, pulses, raw_text || null]
     );
 
-    // Tell the ESP32 to open the valve, via the raw device WebSocket.
-    sendToDevice(session.deviceId, {
+    const delivered = sendToDevice(device_id, {
       type: 'dispense',
-      source: 'upi',
+      valve,
       pulses,
-      order_id: session.orderId
+      source: 'upi',
     });
 
-    // Also let the vendor app know, for live dashboard updates.
     const io = req.app.get('io');
-    io.of('/app').to(`vendor:${vendorId}`).emit('payment_matched', {
-      device_id: session.deviceId,
-      amount: Number(amount),
-      order_id: session.orderId
-    });
+    if (io) {
+      io.of('/app').to(`vendor:${vendorId}`).emit('payment_matched', {
+        device_id, valve, amount: Number(amount),
+      });
+    }
 
-    res.json({ matched: true, device_id: session.deviceId, pulses });
+    res.json({ matched: true, device_id, valve, pulses, delivered });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'failed to process notification' });
