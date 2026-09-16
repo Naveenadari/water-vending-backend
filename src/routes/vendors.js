@@ -52,7 +52,7 @@ router.post('/signup', async (req, res) => {
 
     const vendorResult = await pool.query(
       `INSERT INTO vendors (name, phone, admin_pin) VALUES ($1, $2, $3)
-       RETURNING id, name, phone, upi_id`,
+       RETURNING id, name, phone, upi_id, is_activated`,
       [name, phone, pin]
     );
     const vendor = vendorResult.rows[0];
@@ -84,7 +84,7 @@ router.post('/login', async (req, res) => {
   if (!phone || !pin) return res.status(400).json({ error: 'phone and pin required' });
   try {
     const result = await pool.query(
-      `SELECT id, name, phone, upi_id FROM vendors WHERE phone = $1 AND admin_pin = $2`,
+      `SELECT id, name, phone, upi_id, is_activated FROM vendors WHERE phone = $1 AND admin_pin = $2`,
       [phone, pin]
     );
     if (result.rows.length === 0) {
@@ -101,6 +101,36 @@ router.get('/:id', requireAdmin, async (req, res) => {
   const result = await pool.query(`SELECT id, name, phone, upi_id, created_at FROM vendors WHERE id = $1`, [req.params.id]);
   if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
   res.json(result.rows[0]);
+});
+
+// Public - the Activate screen fetches the current one-time activation price.
+router.get('/activation-price', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT value FROM app_settings WHERE key = 'activation_price_rupees'`);
+    res.json({ price_rupees: Number(result.rows[0]?.value || 0) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'failed to fetch activation price' });
+  }
+});
+
+// Admin-only - you set/change this any time from admin-tool.html.
+router.post('/activation-price', requireAdmin, async (req, res) => {
+  const { price_rupees } = req.body;
+  if (!price_rupees || Number(price_rupees) <= 0) {
+    return res.status(400).json({ error: 'price_rupees required' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('activation_price_rupees', $1)
+       ON CONFLICT (key) DO UPDATE SET value = $1`,
+      [String(price_rupees)]
+    );
+    res.json({ ok: true, price_rupees: Number(price_rupees) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'failed to update activation price' });
+  }
 });
 
 module.exports = { router, requireAdmin };
