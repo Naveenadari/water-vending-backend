@@ -120,6 +120,17 @@ router.post('/webhook', async (req, res) => {
     const event = req.body;
     console.log('razorpay webhook: event =', event.event);
 
+    // App-activation one-time payment, made via a Payment Link (not a QR
+    // code) - the vendor_id is in notes, set when the link was created.
+    if (event.event === 'payment_link.paid') {
+      const notes = event.payload.payment_link.entity.notes || {};
+      if (notes.purpose === 'app_activation' && notes.vendor_id) {
+        await pool.query(`UPDATE vendors SET is_activated = true WHERE id = $1`, [notes.vendor_id]);
+        console.log(`razorpay webhook: vendor ${notes.vendor_id} activated`);
+      }
+      return;
+    }
+
     // QR-code payments arrive as "qr_code.credited" - THIS is where the
     // qr_code id actually lives, not on payment.captured (which is what we
     // were checking before - it never has qr_code_id, hence "undefined").
@@ -257,6 +268,47 @@ router.post('/payment-mode', async (req, res) => {
   } catch (err) {
     console.error('payment mode update failed', err);
     res.status(500).json({ error: 'failed to update payment mode' });
+  }
+});
+
+// Creates a one-time Razorpay Payment Link for a newly signed-up vendor's
+// app-activation fee. The vendor_id is tagged in `notes` so the webhook
+// (payment_link.paid, handled below) knows whose account to activate.
+router.post('/activation-payment-link', async (req, res) => {
+  const { vendor_id, vendor_name, vendor_phone } = req.body;
+  if (!vendor_id) return res.status(400).json({ error: 'vendor_id required' });
+  try {
+    const priceQ = await pool.query(`SELECT value FROM app_settings WHERE key = 'activation_price_rupees'`);
+    const priceRupees = Number(priceQ.rows[0]?.value || 0);
+    if (!priceRupees) return res.status(500).json({ error: 'activation price not configured' });
+
+    const link = await razorpay.paymentLink.create({
+      amount: Math.round(priceRupees * 100),
+      currency: 'INR',
+      accept_partial: false,
+      description: 'Sol Electronics - App activation',
+      customer: { name: vendor_name || undefined, contact: vendor_phone || undefined },
+      notify: { sms: false, email: false },
+      notes: { vendor_id, purpose: 'app_activation' },
+    });
+
+    res.json({ payment_link_url: link.short_url, price_rupees: priceRupees });
+  } catch (err) {
+    console.error('activation payment link creation failed', err);
+    res.status(500).json({ error: 'failed to create payment link' });
+  }
+});
+
+// Vendor app polls this after opening the payment link, to know when to
+// transition into the main app.
+router.get('/activation-status/:vendorId', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT is_activated FROM vendors WHERE id = $1`, [req.params.vendorId]);
+    if (!result.rows[0]) return res.status(404).json({ error: 'vendor not found' });
+    res.json({ is_activated: result.rows[0].is_activated });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'failed to check activation status' });
   }
 });
 
