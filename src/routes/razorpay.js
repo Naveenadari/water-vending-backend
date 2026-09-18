@@ -120,14 +120,29 @@ router.post('/webhook', async (req, res) => {
     const event = req.body;
     console.log('razorpay webhook: event =', event.event);
 
-    // App-activation one-time payment, made via a Payment Link (not a QR
-    // code) - the vendor_id is in notes, set when the link was created.
-    if (event.event === 'payment_link.paid') {
-      const notes = event.payload.payment_link.entity.notes || {};
+    // App-activation one-time payment, made via a Payment Link. Payment
+    // Links on this account fire as "payment.captured" (not
+    // "payment_link.paid" - that event isn't subscribed here), so we read
+    // the notes straight off the payment entity, which inherits them from
+    // the link it was created against.
+    if (event.event === 'payment.captured') {
+      const payment = event.payload.payment.entity;
+      const notes = payment.notes || {};
       if (notes.purpose === 'app_activation' && notes.vendor_id) {
-        await pool.query(`UPDATE vendors SET is_activated = true WHERE id = $1`, [notes.vendor_id]);
-        console.log(`razorpay webhook: vendor ${notes.vendor_id} activated`);
+        const already = await pool.query(`SELECT is_activated FROM vendors WHERE id = $1`, [notes.vendor_id]);
+        if (already.rows[0] && !already.rows[0].is_activated) {
+          await pool.query(`UPDATE vendors SET is_activated = true WHERE id = $1`, [notes.vendor_id]);
+          console.log(`razorpay webhook: vendor ${notes.vendor_id} activated (payment ${payment.id})`);
+        } else {
+          console.log(`razorpay webhook: vendor ${notes.vendor_id} already activated, ignoring duplicate payment ${payment.id}`);
+        }
+        return;
       }
+      // A payment.captured that ISN'T an activation payment - it's not one
+      // of ours (vending payments arrive via qr_code.credited instead), so
+      // hand it to water-management.
+      console.log('razorpay webhook: payment.captured with no matching purpose, forwarding to water-management');
+      await forwardToWaterManagement(req.rawBody, signature);
       return;
     }
 
