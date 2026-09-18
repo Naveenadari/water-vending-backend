@@ -133,4 +133,50 @@ router.post('/activation-price', requireAdmin, async (req, res) => {
   }
 });
 
+// Public - the Contact tab fetches the vendor support number.
+router.get('/support-phone', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT value FROM app_settings WHERE key = 'support_phone_number'`);
+    res.json({ phone: result.rows[0]?.value || null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'failed to fetch support phone' });
+  }
+});
+
+// Admin-only - set/change from admin-tool.html any time.
+router.post('/support-phone', requireAdmin, async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'phone required' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('support_phone_number', $1)
+       ON CONFLICT (key) DO UPDATE SET value = $1`,
+      [phone]
+    );
+    res.json({ ok: true, phone });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'failed to update support phone' });
+  }
+});
+
+// Called after the app has already verified phone ownership via Firebase
+// OTP (client-side) - resets the PIN with no need for the old one.
+router.post('/reset-pin', async (req, res) => {
+  const { phone, new_pin } = req.body;
+  if (!phone || !new_pin) return res.status(400).json({ error: 'phone and new_pin required' });
+  try {
+    const result = await pool.query(
+      `UPDATE vendors SET admin_pin = $1 WHERE phone = $2 RETURNING id`,
+      [new_pin, phone]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'no vendor with that phone number' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'failed to reset PIN' });
+  }
+});
+
 module.exports = { router, requireAdmin };
