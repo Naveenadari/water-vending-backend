@@ -97,13 +97,13 @@ router.post('/login', async (req, res) => {
   }
 });
 
-router.get('/:id', requireAdmin, async (req, res) => {
-  const result = await pool.query(`SELECT id, name, phone, upi_id, created_at FROM vendors WHERE id = $1`, [req.params.id]);
-  if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
-  res.json(result.rows[0]);
-});
-
 // Public - the Activate screen fetches the current one-time activation price.
+// IMPORTANT: these literal-path GET routes (activation-price, support-phone)
+// must be declared BEFORE the generic GET '/:id' route below. Express tries
+// routes in the order they're registered, so if '/:id' came first it would
+// swallow requests like "/support-phone" (treating "support-phone" as the
+// id) and wrongly apply requireAdmin to them - which is exactly the bug that
+// was breaking the Contact tab's support number.
 router.get('/activation-price', async (req, res) => {
   try {
     const result = await pool.query(`SELECT value FROM app_settings WHERE key = 'activation_price_rupees'`);
@@ -177,6 +177,16 @@ router.post('/reset-pin', async (req, res) => {
     console.error(err);
     res.status(500).json({ error: 'failed to reset PIN' });
   }
+});
+
+// Generic "get vendor by id" - kept admin-only. Constrained to digits only
+// (id(\d+)) and declared LAST among GET routes so it can never intercept a
+// literal path like /support-phone or /activation-price ever again, even if
+// more such routes are added above in the future.
+router.get('/:id(\\d+)', requireAdmin, async (req, res) => {
+  const result = await pool.query(`SELECT id, name, phone, upi_id, created_at FROM vendors WHERE id = $1`, [req.params.id]);
+  if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
+  res.json(result.rows[0]);
 });
 
 module.exports = { router, requireAdmin };
