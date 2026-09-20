@@ -7,6 +7,14 @@ const router = express.Router();
 
 const VALVE_NAMES = ['Normal', 'Cooling'];
 
+// Normal water (valve 0) now has a 3rd preset button (Button 3) in addition
+// to the original 2; Cooling (valve 1) keeps its original 2. Centralized
+// here so device-creation and the self-heal check below always agree.
+function slotsForValve(valve, hardware) {
+  if (hardware === 'upi_only') return 4; // unchanged: UPI-only machines already had 4
+  return valve === 0 ? 3 : 2;
+}
+
 function generateClaimCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no O/0/I/1 to avoid confusion
   let code = 'SOL-';
@@ -24,7 +32,6 @@ router.post('/', requireAdmin, async (req, res) => {
   const code = claim_code || generateClaimCode();
   const valveCount = [1, 2].includes(Number(valve_count)) ? Number(valve_count) : 2;
   const hardware = payment_hardware === 'upi_only' ? 'upi_only' : 'full';
-  const slotsPerValve = hardware === 'upi_only' ? 4 : 2;
   const valves = valveCount === 1 ? [0] : [0, 1]; // single tap = Normal (valve 0) only
 
   try {
@@ -39,11 +46,12 @@ router.post('/', requireAdmin, async (req, res) => {
     // Shared, device-level settings (one row per device) - topup/timeout/confirm_mode
     await pool.query(`INSERT INTO device_settings (device_id) VALUES ($1)`, [device.id]);
 
-    // Per-valve settings + presets (2 slots for coin/card/UPI machines,
-    // 4 slots for UPI-only machines that need more volume options)
+    // Per-valve settings + presets (Normal now gets 3 preset slots, Cooling
+    // keeps 2; UPI-only machines keep 4 for both - see slotsForValve above)
     for (const valve of valves) {
       await pool.query(`INSERT INTO settings (device_id, valve) VALUES ($1, $2)`, [device.id, valve]);
-      for (let slot = 0; slot < slotsPerValve; slot++) {
+      const slotCount = slotsForValve(valve, hardware);
+      for (let slot = 0; slot < slotCount; slot++) {
         await pool.query(
           `INSERT INTO presets (device_id, valve, slot_index, pulses, price_rupees) VALUES ($1, $2, $3, 0, 0)`,
           [device.id, valve, slot]
@@ -104,6 +112,31 @@ router.get('/:deviceId', async (req, res) => {
   try {
     const deviceQ = await pool.query(`SELECT * FROM devices WHERE id = $1`, [req.params.deviceId]);
     if (deviceQ.rows.length === 0) return res.status(404).json({ error: 'not found' });
+    const device = deviceQ.rows[0];
+
+    // Self-heal: devices provisioned BEFORE Normal water's 3rd preset button
+    // existed only have slot_index 0/1 rows in `presets` for valve 0. Rather
+    // than requiring a one-off manual database command, fill in whatever's
+    // missing right here - this route already runs every ~15s from the
+    // vendor app's polling, so any device gets the missing row(s) added the
+    // next time it's read, with no downtime or manual step needed.
+    const valveIndices = device.valve_count === 1 ? [0] : [0, 1];
+    for (const valve of valveIndices) {
+      const requiredSlots = slotsForValve(valve, device.payment_hardware);
+      const existingQ = await pool.query(
+        `SELECT slot_index FROM presets WHERE device_id = $1 AND valve = $2`,
+        [req.params.deviceId, valve]
+      );
+      const existingSlots = new Set(existingQ.rows.map((r) => r.slot_index));
+      for (let slot = 0; slot < requiredSlots; slot++) {
+        if (!existingSlots.has(slot)) {
+          await pool.query(
+            `INSERT INTO presets (device_id, valve, slot_index, pulses, price_rupees) VALUES ($1, $2, $3, 0, 0)`,
+            [req.params.deviceId, valve, slot]
+          );
+        }
+      }
+    }
 
     const [deviceSettingsQ, settingsQ, presetsQ, qrPricesQ, txQ] = await Promise.all([
       pool.query(
@@ -136,8 +169,6 @@ router.get('/:deviceId', async (req, res) => {
     // for the valves this specific machine actually has (1 for single tap,
     // 2 for dual tap) - showing a fake "Cooling" section on a single-tap
     // machine would be wrong.
-    const device = deviceQ.rows[0];
-    const valveIndices = device.valve_count === 1 ? [0] : [0, 1];
     const valves = valveIndices.map((v) => ({
       valve: v,
       name: VALVE_NAMES[v],
