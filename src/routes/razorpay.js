@@ -232,20 +232,22 @@ router.post('/webhook', async (req, res) => {
 // the firmware at all (unlike the manual button presets) - the webhook
 // above reads it directly when matching an incoming payment amount.
 router.post('/price', async (req, res) => {
-  const { device_id, vendor_id, valve, slot_index, price_rupees, litres } = req.body;
-  if (!device_id || !vendor_id || valve === undefined || slot_index === undefined || !price_rupees || !litres) {
-    return res.status(400).json({ error: 'device_id, vendor_id, valve, slot_index, price_rupees and litres are required' });
+  // Takes `pulses` directly now, not `litres`. This used to convert litres
+  // -> pulses here using device_settings.pulses_per_liter, but that shared
+  // rate (set via the "Calibrate flow sensor" flow) doesn't always match
+  // what a real automatic dispense actually delivers - so the vendor now
+  // enters the exact pulses number they've verified by testing a real
+  // dispense against a real container, with no conversion step to trust.
+  const { device_id, vendor_id, valve, slot_index, price_rupees, pulses: pulsesInput } = req.body;
+  if (!device_id || !vendor_id || valve === undefined || slot_index === undefined || !price_rupees || !pulsesInput) {
+    return res.status(400).json({ error: 'device_id, vendor_id, valve, slot_index, price_rupees and pulses are required' });
   }
   try {
     const deviceRes = await pool.query(`SELECT vendor_id FROM devices WHERE id = $1`, [device_id]);
     if (!deviceRes.rows[0] || deviceRes.rows[0].vendor_id !== vendor_id) {
       return res.status(403).json({ error: 'not your device' });
     }
-    const settingsRes = await pool.query(
-      `SELECT pulses_per_liter FROM device_settings WHERE device_id = $1`, [device_id]
-    );
-    const pulsesPerLiter = settingsRes.rows[0]?.pulses_per_liter || 240;
-    const pulses = Math.round(litres * pulsesPerLiter);
+    const pulses = Math.round(pulsesInput);
     await pool.query(
       `INSERT INTO qr_prices (device_id, valve, slot_index, price_rupees, pulses)
        VALUES ($1, $2, $3, $4, $5)
