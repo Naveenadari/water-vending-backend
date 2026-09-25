@@ -12,4 +12,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping backend
-        run: curl -sS -o /dev/null -w "Status: %{http_code}\n" https://water-vending-backend.onrender.com
+        run: "curl -sS -o /dev/null -w 'Status: %{http_code}\\n' https://water-vending-backend.onrender.com"
