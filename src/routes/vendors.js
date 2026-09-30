@@ -189,4 +189,117 @@ router.get('/:id(\\d+)', requireAdmin, async (req, res) => {
   res.json(result.rows[0]);
 });
 
+// TEMPORARY one-time migration helper - copies every table's schema + rows
+// from THIS backend's own database (whatever DATABASE_URL currently points
+// to) into another Postgres database given by connection string. Used once
+// to move from the old (soon-to-expire) Render Postgres to a new provider,
+// without needing raw TCP access from anywhere except this server itself
+// (which already talks to Postgres fine). Admin-key gated. Safe to call more
+// than once - every insert is ON CONFLICT DO NOTHING, so re-running just
+// fills in anything new since the last run. Remove this route once the
+// migration is confirmed working and no longer needed.
+router.post('/admin/migrate-db', requireAdmin, async (req, res) => {
+  const { target_url } = req.body;
+  if (!target_url) return res.status(400).json({ error: 'target_url required' });
+
+  const { Client } = require('pg');
+  const target = new Client({ connectionString: target_url, ssl: { rejectUnauthorized: false } });
+  const report = { tables: {}, errors: [] };
+
+  try {
+    await target.connect();
+    try {
+      await target.query('CREATE EXTENSION IF NOT EXISTS "pgcrypto"');
+    } catch (e) {
+      report.errors.push('pgcrypto: ' + e.message);
+    }
+
+    const tablesResult = await pool.query(
+      `SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'`
+    );
+    const tableNames = tablesResult.rows.map((r) => r.table_name);
+
+    for (const table of tableNames) {
+      try {
+        const colsResult = await pool.query(
+          `SELECT column_name, data_type, udt_name, is_nullable, column_default, character_maximum_length
+           FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 ORDER BY ordinal_position`,
+          [table]
+        );
+        const pkResult = await pool.query(
+          `SELECT kcu.column_name FROM information_schema.table_constraints tc
+           JOIN information_schema.key_column_usage kcu
+             ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+           WHERE tc.table_schema='public' AND tc.table_name=$1 AND tc.constraint_type='PRIMARY KEY'`,
+          [table]
+        );
+        const pkCols = pkResult.rows.map((r) => r.column_name);
+        const colTypes = {};
+
+        const colDefs = colsResult.rows.map((c) => {
+          colTypes[c.column_name] = c.data_type;
+          let type = c.data_type === 'USER-DEFINED' ? c.udt_name : c.data_type;
+          if (c.data_type === 'character varying' && c.character_maximum_length) {
+            type = `varchar(${c.character_maximum_length})`;
+          }
+          let def = `"${c.column_name}" ${type}`;
+          if (c.column_default && !c.column_default.includes('nextval(')) {
+            def += ` DEFAULT ${c.column_default}`;
+          }
+          if (c.is_nullable === 'NO') def += ' NOT NULL';
+          return def;
+        });
+
+        let createSql = `CREATE TABLE IF NOT EXISTS "${table}" (${colDefs.join(', ')}`;
+        if (pkCols.length > 0) {
+          createSql += `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})`;
+        }
+        createSql += ')';
+        await target.query(createSql);
+
+        const dataResult = await pool.query(`SELECT * FROM "${table}"`);
+        let inserted = 0;
+        for (const row of dataResult.rows) {
+          const cols = Object.keys(row);
+          const values = cols.map((c) => {
+            const v = row[c];
+            if ((colTypes[c] === 'json' || colTypes[c] === 'jsonb') && v !== null) {
+              return JSON.stringify(v);
+            }
+            return v;
+          });
+          const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+          const colList = cols.map((c) => `"${c}"`).join(', ');
+          const onConflict =
+            pkCols.length > 0
+              ? ` ON CONFLICT (${pkCols.map((c) => `"${c}"`).join(', ')}) DO NOTHING`
+              : '';
+          try {
+            await target.query(
+              `INSERT INTO "${table}" (${colList}) VALUES (${placeholders})${onConflict}`,
+              values
+            );
+            inserted++;
+          } catch (rowErr) {
+            report.errors.push(`${table} row insert: ${rowErr.message}`);
+          }
+        }
+        report.tables[table] = { total: dataResult.rows.length, inserted };
+      } catch (tableErr) {
+        report.errors.push(`${table}: ${tableErr.message}`);
+      }
+    }
+
+    await target.end();
+    res.json(report);
+  } catch (err) {
+    try {
+      await target.end();
+    } catch (e) {
+      /* ignore */
+    }
+    console.error(err);
+    res.status(500).json({ error: 'migration failed', detail: err.message, report });
+  }
+});
 module.exports = { router, requireAdmin };
