@@ -355,4 +355,72 @@ router.post('/admin/sync-unique-constraints', requireAdmin, async (req, res) => 
     res.status(500).json({ error: 'sync failed', detail: err.message, report });
   }
 });
+// TEMPORARY - re-applies every UNIQUE constraint found on a SOURCE Postgres
+// database onto a TARGET Postgres database, given two connection strings.
+// Needed because the old migration (admin/migrate-db) copied columns and
+// primary keys but not UNIQUE constraints (e.g. qr_prices' per-button
+// uniqueness, devices.device_token). Unlike the earlier sync-unique-constraints
+// route, this one does NOT assume the source is "whatever this backend's
+// DATABASE_URL currently points to" - it takes an explicit source_url, so it
+// still works after DATABASE_URL has already been switched over to the new
+// database. Safe to run more than once. Remove this route once no longer
+// needed.
+router.post('/admin/sync-unique-constraints-v2', requireAdmin, async (req, res) => {
+  const { source_url, target_url } = req.body;
+  if (!source_url || !target_url) {
+    return res.status(400).json({ error: 'source_url and target_url required' });
+  }
+
+  const { Client } = require('pg');
+  const source = new Client({ connectionString: source_url, ssl: { rejectUnauthorized: false } });
+  const target = new Client({ connectionString: target_url, ssl: { rejectUnauthorized: false } });
+  const report = { applied: [], errors: [] };
+
+  try {
+    await source.connect();
+    await target.connect();
+
+    const constraintsResult = await source.query(`
+      SELECT tc.table_name, tc.constraint_name,
+             array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS cols
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+      WHERE tc.table_schema='public' AND tc.constraint_type='UNIQUE'
+      GROUP BY tc.table_name, tc.constraint_name
+    `);
+
+    for (const row of constraintsResult.rows) {
+      const cols = row.cols.map((c) => `"${c}"`).join(', ');
+      const sql = `ALTER TABLE "${row.table_name}" ADD CONSTRAINT "${row.constraint_name}" UNIQUE (${cols})`;
+      try {
+        await target.query(sql);
+        report.applied.push(`${row.table_name}: ${row.constraint_name} (${row.cols.join(', ')})`);
+      } catch (e) {
+        if (e.code === '42710' || /already exists/i.test(e.message)) {
+          report.applied.push(`${row.table_name}: ${row.constraint_name} (already existed)`);
+        } else {
+          report.errors.push(`${row.table_name} ${row.constraint_name}: ${e.message}`);
+        }
+      }
+    }
+
+    await source.end();
+    await target.end();
+    res.json(report);
+  } catch (err) {
+    try {
+      await source.end();
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      await target.end();
+    } catch (e) {
+      /* ignore */
+    }
+    console.error(err);
+    res.status(500).json({ error: 'sync failed', detail: err.message, report });
+  }
+});
 module.exports = { router, requireAdmin };
