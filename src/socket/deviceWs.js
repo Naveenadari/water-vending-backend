@@ -46,6 +46,19 @@ function setupDeviceWebSocket(httpServer, appNs) {
   pool.query(`ALTER TABLE device_settings ADD COLUMN IF NOT EXISTS dispense_safety_seconds INT NOT NULL DEFAULT 180`)
     .catch((err) => console.error('failed to add dispense_safety_seconds column on boot', err));
 
+  // Same idempotent-on-boot pattern: pulses_per_liter moves from being a
+  // single shared number (device_settings) to being PER VALVE (settings),
+  // since Normal and Cooling each have their own flow sensor and their own
+  // calibration. calib_total_pulses/calib_target_liters remember the exact
+  // last calibration result per tap, so the app can keep showing it
+  // permanently (not just in a toast) even after a reopen/restart.
+  pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS pulses_per_liter REAL NOT NULL DEFAULT 240`)
+    .catch((err) => console.error('failed to add pulses_per_liter column on boot', err));
+  pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS calib_total_pulses REAL NOT NULL DEFAULT 0`)
+    .catch((err) => console.error('failed to add calib_total_pulses column on boot', err));
+  pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS calib_target_liters REAL NOT NULL DEFAULT 0`)
+    .catch((err) => console.error('failed to add calib_target_liters column on boot', err));
+
   httpServer.on('upgrade', (request, socket, head) => {
     const { pathname, query } = url.parse(request.url, true);
     if (pathname !== '/device') return; // let socket.io handle its own upgrade
@@ -115,9 +128,18 @@ function setupDeviceWebSocket(httpServer, appNs) {
 
         case 'settings_update':
           // { type:'settings_update', valve, presets:[{slot_index,pulses}],
-          //   settings:{ pulses_per_rupee, trip_cost,           <- per-valve
+          //   settings:{ pulses_per_rupee, trip_cost, pulses_per_liter,     <- per-valve
+          //              calib_total_pulses, calib_target_liters,          <- per-valve
           //              topup_amount, timeout_seconds, confirm_mode,
-          //              pulses_per_liter, dispense_safety_seconds } }  <- shared
+          //              dispense_safety_seconds } }                       <- shared
+          //
+          // NOTE: pulses_per_liter (and the calibration result that produced
+          // it) used to be a SINGLE shared number for the whole device, even
+          // though Normal and Cooling each have their OWN physical flow
+          // sensor. That meant calibrating one tap silently overwrote the
+          // number the other tap was using too. Firmware now tracks/sends
+          // these per valve, so they're saved into the per-valve `settings`
+          // row here, not the shared `device_settings` row.
           try {
             if (msg.presets) {
               for (const p of msg.presets) {
@@ -133,29 +155,29 @@ function setupDeviceWebSocket(httpServer, appNs) {
               // Per-valve fields -> settings table, keyed by (device_id, valve)
               await pool.query(
                 `UPDATE settings SET pulses_per_rupee = COALESCE($1, pulses_per_rupee),
-                                      trip_cost = COALESCE($2, trip_cost)
-                 WHERE device_id = $3 AND valve = $4`,
-                [s.pulses_per_rupee, s.trip_cost, deviceId, valve]
+                                      trip_cost = COALESCE($2, trip_cost),
+                                      pulses_per_liter = COALESCE($3, pulses_per_liter),
+                                      calib_total_pulses = COALESCE($4, calib_total_pulses),
+                                      calib_target_liters = COALESCE($5, calib_target_liters)
+                 WHERE device_id = $6 AND valve = $7`,
+                [s.pulses_per_rupee, s.trip_cost, s.pulses_per_liter, s.calib_total_pulses, s.calib_target_liters, deviceId, valve]
               );
 
               // Shared fields -> device_settings table, keyed by device_id only
               // (NOT per valve - one topup amount / timeout / confirm_mode /
-              // pulses_per_liter / dispense_safety_seconds per device, since
-              // it's one flow sensor per tap but calibration/safety settings
-              // are stored device-wide for simplicity)
+              // dispense_safety_seconds per device; these really are shared
+              // across both taps)
               if (s.topup_amount !== undefined || s.timeout_seconds !== undefined
-                  || s.confirm_mode !== undefined || s.pulses_per_liter !== undefined
-                  || s.dispense_safety_seconds !== undefined) {
+                  || s.confirm_mode !== undefined || s.dispense_safety_seconds !== undefined) {
                 await pool.query(
-                  `INSERT INTO device_settings (device_id, topup_amount, timeout_seconds, confirm_mode, pulses_per_liter, dispense_safety_seconds)
-                   VALUES ($1, COALESCE($2, 100), COALESCE($3, 30), COALESCE($4, true), COALESCE($5, 240), COALESCE($6, 180))
+                  `INSERT INTO device_settings (device_id, topup_amount, timeout_seconds, confirm_mode, dispense_safety_seconds)
+                   VALUES ($1, COALESCE($2, 100), COALESCE($3, 30), COALESCE($4, true), COALESCE($5, 180))
                    ON CONFLICT (device_id) DO UPDATE SET
                      topup_amount = COALESCE($2, device_settings.topup_amount),
                      timeout_seconds = COALESCE($3, device_settings.timeout_seconds),
                      confirm_mode = COALESCE($4, device_settings.confirm_mode),
-                     pulses_per_liter = COALESCE($5, device_settings.pulses_per_liter),
-                     dispense_safety_seconds = COALESCE($6, device_settings.dispense_safety_seconds)`,
-                  [deviceId, s.topup_amount, s.timeout_seconds, s.confirm_mode, s.pulses_per_liter, s.dispense_safety_seconds]
+                     dispense_safety_seconds = COALESCE($5, device_settings.dispense_safety_seconds)`,
+                  [deviceId, s.topup_amount, s.timeout_seconds, s.confirm_mode, s.dispense_safety_seconds]
                 );
               }
             }
