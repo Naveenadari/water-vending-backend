@@ -140,7 +140,7 @@ router.get('/:deviceId', async (req, res) => {
 
     const [deviceSettingsQ, settingsQ, presetsQ, qrPricesQ, txQ] = await Promise.all([
       pool.query(
-        `SELECT topup_amount, timeout_seconds, confirm_mode, pulses_per_liter FROM device_settings WHERE device_id = $1`,
+        `SELECT topup_amount, timeout_seconds, confirm_mode, pulses_per_liter, dispense_safety_seconds FROM device_settings WHERE device_id = $1`,
         [req.params.deviceId]
       ),
       pool.query(
@@ -179,7 +179,7 @@ router.get('/:deviceId', async (req, res) => {
 
     res.json({
       device,
-      device_settings: deviceSettingsQ.rows[0] || { topup_amount: 100, timeout_seconds: 30, confirm_mode: true },
+      device_settings: deviceSettingsQ.rows[0] || { topup_amount: 100, timeout_seconds: 30, confirm_mode: true, dispense_safety_seconds: 180 },
       valves,
       recent_transactions: txQ.rows,
     });
