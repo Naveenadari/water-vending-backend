@@ -38,6 +38,14 @@ function setupDeviceWebSocket(httpServer, appNs) {
   pool.query(`UPDATE devices SET is_online = false WHERE is_online = true`)
     .catch((err) => console.error('failed to reset device online status on boot', err));
 
+  // One-time (per boot, idempotent) column add for the new app-configurable
+  // safety-cutoff-time feature. Needed because device_settings already
+  // existed in production before this column was added, and there's no
+  // separate migration runner for this project - every other shared setting
+  // column was added the same way. Safe to run on every boot.
+  pool.query(`ALTER TABLE device_settings ADD COLUMN IF NOT EXISTS dispense_safety_seconds INT NOT NULL DEFAULT 180`)
+    .catch((err) => console.error('failed to add dispense_safety_seconds column on boot', err));
+
   httpServer.on('upgrade', (request, socket, head) => {
     const { pathname, query } = url.parse(request.url, true);
     if (pathname !== '/device') return; // let socket.io handle its own upgrade
@@ -108,7 +116,8 @@ function setupDeviceWebSocket(httpServer, appNs) {
         case 'settings_update':
           // { type:'settings_update', valve, presets:[{slot_index,pulses}],
           //   settings:{ pulses_per_rupee, trip_cost,           <- per-valve
-          //              topup_amount, timeout_seconds, confirm_mode } }  <- shared
+          //              topup_amount, timeout_seconds, confirm_mode,
+          //              pulses_per_liter, dispense_safety_seconds } }  <- shared
           try {
             if (msg.presets) {
               for (const p of msg.presets) {
@@ -131,19 +140,22 @@ function setupDeviceWebSocket(httpServer, appNs) {
 
               // Shared fields -> device_settings table, keyed by device_id only
               // (NOT per valve - one topup amount / timeout / confirm_mode /
-              // pulses_per_liter per device, since it's one flow sensor per tap
-              // but calibration is stored device-wide for simplicity)
+              // pulses_per_liter / dispense_safety_seconds per device, since
+              // it's one flow sensor per tap but calibration/safety settings
+              // are stored device-wide for simplicity)
               if (s.topup_amount !== undefined || s.timeout_seconds !== undefined
-                  || s.confirm_mode !== undefined || s.pulses_per_liter !== undefined) {
+                  || s.confirm_mode !== undefined || s.pulses_per_liter !== undefined
+                  || s.dispense_safety_seconds !== undefined) {
                 await pool.query(
-                  `INSERT INTO device_settings (device_id, topup_amount, timeout_seconds, confirm_mode, pulses_per_liter)
-                   VALUES ($1, COALESCE($2, 100), COALESCE($3, 30), COALESCE($4, true), COALESCE($5, 240))
+                  `INSERT INTO device_settings (device_id, topup_amount, timeout_seconds, confirm_mode, pulses_per_liter, dispense_safety_seconds)
+                   VALUES ($1, COALESCE($2, 100), COALESCE($3, 30), COALESCE($4, true), COALESCE($5, 240), COALESCE($6, 180))
                    ON CONFLICT (device_id) DO UPDATE SET
                      topup_amount = COALESCE($2, device_settings.topup_amount),
                      timeout_seconds = COALESCE($3, device_settings.timeout_seconds),
                      confirm_mode = COALESCE($4, device_settings.confirm_mode),
-                     pulses_per_liter = COALESCE($5, device_settings.pulses_per_liter)`,
-                  [deviceId, s.topup_amount, s.timeout_seconds, s.confirm_mode, s.pulses_per_liter]
+                     pulses_per_liter = COALESCE($5, device_settings.pulses_per_liter),
+                     dispense_safety_seconds = COALESCE($6, device_settings.dispense_safety_seconds)`,
+                  [deviceId, s.topup_amount, s.timeout_seconds, s.confirm_mode, s.pulses_per_liter, s.dispense_safety_seconds]
                 );
               }
             }
