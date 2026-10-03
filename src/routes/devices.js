@@ -144,7 +144,8 @@ router.get('/:deviceId', async (req, res) => {
         [req.params.deviceId]
       ),
       pool.query(
-        `SELECT valve, pulses_per_rupee, trip_cost FROM settings WHERE device_id = $1 ORDER BY valve`,
+        `SELECT valve, pulses_per_rupee, trip_cost, pulses_per_liter, calib_total_pulses, calib_target_liters
+         FROM settings WHERE device_id = $1 ORDER BY valve`,
         [req.params.deviceId]
       ),
       pool.query(
@@ -172,7 +173,7 @@ router.get('/:deviceId', async (req, res) => {
     const valves = valveIndices.map((v) => ({
       valve: v,
       name: VALVE_NAMES[v],
-      settings: settingsQ.rows.find((r) => r.valve === v) || { pulses_per_rupee: 20, trip_cost: 20 },
+      settings: settingsQ.rows.find((r) => r.valve === v) || { pulses_per_rupee: 20, trip_cost: 20, pulses_per_liter: 240, calib_total_pulses: 0, calib_target_liters: 0 },
       presets: presetsQ.rows.filter((r) => r.valve === v),
       qr_prices: qrPricesQ.rows.filter((r) => r.valve === v),
     }));
